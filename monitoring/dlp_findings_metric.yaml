@@ -1,0 +1,15 @@
+# Log-based metric: counts DLP findings, with the InfoType as a label.
+# Create it with:
+#   gcloud logging metrics create dlp_findings --config-from-file=monitoring/dlp_findings_metric.yaml
+description: DLP findings written by dlp/scan_and_log.py, labelled by InfoType
+filter: logName:"dlp-findings" AND jsonPayload.event="dlp_finding"
+metricDescriptor:
+  metricKind: DELTA
+  valueType: INT64
+  unit: "1"
+  labels:
+    - key: info_type
+      valueType: STRING
+      description: Type of sensitive data found
+labelExtractors:
+  info_type: EXTRACT(jsonPayload.info_type)

@@ -1,0 +1,6 @@
+customer_id,full_name,email,phone,credit_card,dni,city
+1001,Laura Gómez,laura.gomez@example.com,+34 612 345 678,4111111111111111,12345678Z,Valencia
+1002,Javier Martín,javier.martin@example.com,+34 622 456 789,5555555555554444,87654321X,Madrid
+1003,Lucía Fernández,lucia.fernandez@example.org,+34 633 567 890,4012888888881881,11111111H,Sevilla
+1004,Carlos Ruiz,carlos.ruiz@example.net,+34 644 678 901,378282246310005,00000000T,Bilbao
+1005,Marta Sánchez,marta.sanchez@example.com,+34 655 789 012,6011111111111117,12345678Z,Barcelona
