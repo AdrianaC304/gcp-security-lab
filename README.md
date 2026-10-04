@@ -1,12 +1,12 @@
-# GCP Security — IAM · DLP · Logging · Monitoring
+# GCP Security — IAM · Secret Manager · KMS · DLP · Logging · Monitoring
 
 Four short activities that put into practice the **Google Security and Logging** session:
 
 | # | Activity | Topic | Time |
 |---|---|---|---|
 | — | [Setup](#setup-5-min): prepare the project (one script) | — | 5 min |
-| **1** | [Cloud Run reads Cloud Storage](#activity-1--cloud-run-reads-cloud-storage-15-min) | IAM | 10 min |
-| **2** | [A Compute Engine VM reads BigQuery](#activity-2--a-compute-engine-vm-reads-bigquery-15-min) | IAM | 15 min |
+| **1** | [Cloud Run with a secret from Secret Manager](#activity-1--cloud-run-with-a-secret-from-secret-manager-20-min) | Secret Manager · IAM | 20 min |
+| **2** | [Encrypt data with Cloud KMS](#activity-2--encrypt-data-with-cloud-kms-20-min) | Cloud KMS · IAM | 20 min |
 | **3** | [Scan files with DLP and review the findings in Logging](#activity-3--scan-files-with-dlp-and-review-them-in-logging-20-min) | DLP · Logging | 20 min |
 | **4** | [Build and present a dashboard](#activity-4--build-and-present-a-dashboard-20-min) | Monitoring | 20 min + 3 min per team |
 
@@ -42,26 +42,25 @@ bash scripts/setup.sh
 The script enables the APIs and creates what is *not* part of the exercise:
 
 - a bucket `gs://<project>-lab-files` with a file `reports/sales_by_city.csv`;
-- a BigQuery table `lab_data.customers` with 5 fake customers;
-- an SSH-via-IAP rule so you can connect to the VM.
+- the container image of the app (`file-service`) in Artifact Registry, so deploying in Activity 1 takes seconds.
 
 > [!TIP]
 > **Instructor:** if you ask students to run `setup.sh` before class, Activity 1 starts straight away.
 
 ---
 
-## Activity 1 · Cloud Run reads Cloud Storage (15 min)
+## Activity 1 · Cloud Run with a secret from Secret Manager (20 min)
 
 ![Activity 1](images/activity-1.svg)
 
-**Key idea:** in IAM, a policy is **principal + role, attached to a resource**. In Activities 1 and 2 there are **two different principals**:
+**Goal:** deploy a private Cloud Run service that protects its endpoints with an **API key stored in Secret Manager**, reads files from Cloud Storage, and survives a **key rotation**.
 
-- **you** (a person), who needs to *call* or *see* the service;
-- **a service account** (the app's identity), which needs to *read the data*.
+**Key idea:** in IAM, a policy is **principal + role, attached to a resource**. Here there are **two different principals**:
 
-Each one gets **only its role**, and **on the specific resource**.
+- **you** (a person), who needs to *call* the service;
+- **`run-sa`** (the app's identity), which needs to *read the secret* and *read the bucket*.
 
-**Goal:** a user can invoke the Cloud Run service, and the service can read the files in the bucket.
+Each one gets **only its role**, and **on the specific resource**: one secret, one bucket. Never the whole project.
 
 **1. Give the app its own identity**
 
@@ -69,167 +68,296 @@ Each one gets **only its role**, and **on the specific resource**.
 gcloud iam service-accounts create run-sa --display-name="file-service (Cloud Run)"
 ```
 
-**2. Deploy the private service**
+**2. Store the API key in Secret Manager**
+
+Generate a random key and save it as a secret. It goes straight from `openssl` into Secret Manager: it is never written to a file or to your shell history.
 
 ```bash
-gcloud run deploy $SERVICE --source=app --region=$REGION \
+openssl rand -hex 16 | tr -d '\n' | \
+  gcloud secrets create $SECRET --replication-policy=automatic --data-file=-
+
+gcloud secrets versions list $SECRET
+```
+
+A secret is a container; the value lives in **versions** (`1`, `2`, …). You will need that later.
+
+**3. Deploy the service, with the secret as an environment variable**
+
+The image was already built by `setup.sh`. Read [`app/main.py`](app/main.py): the code **has no credentials and no key**. Cloud Run reads the secret and passes it to the container as `API_KEY`.
+
+```bash
+gcloud run deploy $SERVICE --image=$IMAGE --region=$REGION \
   --service-account=$RUN_SA \
   --no-allow-unauthenticated \
-  --set-env-vars=BUCKET_NAME=$BUCKET
+  --set-env-vars=BUCKET_NAME=$BUCKET \
+  --set-secrets=API_KEY=$SECRET:latest
 ```
 
-If it asks to create an Artifact Registry repository, answer **Y**. While it builds, read [`app/main.py`](app/main.py): the code **has no credentials**. It can only do what IAM allows `run-sa` to do.
+It fails. Read the message:
+
+```text
+Permission denied on secret: projects/.../secrets/file-service-api-key/versions/latest
+for Revision service account run-sa@....
+The service account used must be granted the 'Secret Manager Secret Accessor' role ...
+```
+
+Cloud Run checks **at deploy time** that the service's identity can read the secret. Note *whose* permission is missing: not yours (you are Owner), but **`run-sa`'s**.
+
+**4. Grant `roles/secretmanager.secretAccessor` on that secret only**
 
 ```bash
-source scripts/00-env.sh      # loads $URL
+gcloud secrets add-iam-policy-binding $SECRET \
+  --member="serviceAccount:$RUN_SA" --role="roles/secretmanager.secretAccessor"
 ```
 
-**3. Who can call it? → `roles/run.invoker`**
+Run the `gcloud run deploy` command from step 3 again. This time it works.
 
 ```bash
-# Without identifying yourself
-curl -s -o /dev/null -w "%{http_code}\n" $URL/files
-# 403  ← Cloud Run's IAM stops it before it reaches the code
-
-# Identifying yourself (as Owner you already have run.invoker)
-curl -s -H "Authorization: Bearer $(gcloud auth print-identity-token)" $URL/files
+source scripts/00-env.sh      # loads $URL and $API_KEY
 ```
 
-The second call does reach the app, but it returns **a different error**:
+**5. Three layers, three different errors**
 
-```json
-{"action": "storage.objects.list", "error": "permission denied",
- "hint": "the Cloud Run service account is missing an IAM role on the bucket", ...}
-```
-
-You have permission to call the service, but **the service has no permission on the bucket**. They are two separate grants.
-
-**4. What can the app read? → `roles/storage.objectViewer` on the bucket**
-
-```bash
-gcloud storage buckets add-iam-policy-binding gs://$BUCKET \
-  --member="serviceAccount:$RUN_SA" \
-  --role="roles/storage.objectViewer"
-```
-
-Wait about 30 s and try again:
+Call the service step by step. Each call fails at a different layer:
 
 ```bash
 export TOKEN=$(gcloud auth print-identity-token)
-curl -s -H "Authorization: Bearer $TOKEN" $URL/files
-# {"bucket": "...", "files": ["reports/sales_by_city.csv"]}
 
-curl -s -H "Authorization: Bearer $TOKEN" $URL/files/reports/sales_by_city.csv
-# {"file": "reports/sales_by_city.csv", "first_lines": ["city,orders,revenue_eur", ...]}
+# a) No identity → Cloud Run's IAM (roles/run.invoker) stops it before it reaches the code
+curl -s -o /dev/null -w "%{http_code}\n" $URL/files
+# 403
+
+# b) Identity but no API key → the app stops it
+curl -s -H "Authorization: Bearer $TOKEN" $URL/files
+# {"error": "missing or invalid X-API-Key header"}   (401)
+
+# c) Identity + API key → the app runs, but run-sa cannot read the bucket
+curl -s -H "Authorization: Bearer $TOKEN" -H "X-API-Key: $API_KEY" $URL/files
+# {"action": "storage.objects.list", "error": "permission denied", ...}   (403)
 ```
 
-✅ **Check:** `/files` returns the list and you can read the CSV.
+Grant the last missing role, **on the bucket**:
 
-**5. (Pairs, optional) Give your partner `run.invoker`**
+```bash
+gcloud storage buckets add-iam-policy-binding gs://$BUCKET \
+  --member="serviceAccount:$RUN_SA" --role="roles/storage.objectViewer"
+```
+
+Wait about 30 s and repeat call c):
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" -H "X-API-Key: $API_KEY" $URL/files
+# {"bucket": "...", "files": ["reports/sales_by_city.csv"]}
+```
+
+**6. Rotate the key**
+
+The key has leaked (say, someone pasted it in a chat). Create a new version:
+
+```bash
+openssl rand -hex 16 | tr -d '\n' | gcloud secrets versions add $SECRET --data-file=-
+source scripts/00-env.sh      # $API_KEY is now version 2
+curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $TOKEN" -H "X-API-Key: $API_KEY" $URL/files
+```
+
+**401!** The service is still using the **old** key, even though it points to `latest`. A secret exposed as an environment variable is read **once, when the instance starts**. To pick up the new one you need a new revision. Use the chance to **pin an explicit version** instead of `latest`, so you always know which key is live:
+
+```bash
+gcloud run services update $SERVICE --region=$REGION --update-secrets=API_KEY=$SECRET:2
+curl -s -o /dev/null -w "%{http_code}\n" -H "Authorization: Bearer $TOKEN" -H "X-API-Key: $API_KEY" $URL/files
+# 200
+```
+
+Finally, **disable** the leaked version so nobody can read it any more:
+
+```bash
+gcloud secrets versions disable 1 --secret=$SECRET
+gcloud secrets versions list $SECRET
+```
+
+✅ **Check:** `/files` returns the list with the new key, and version 1 is `DISABLED`.
+
+> [!NOTE]
+> If you mount the secret as a **file** (`--set-secrets=/secrets/api-key=$SECRET:latest`) instead of an environment variable, Cloud Run reads it every time the file is opened, so rotation does not need a new revision.
+
+**7. (Pairs, optional) Metadata vs value**
+
+Give your partner `run.invoker` on the service and `secretmanager.viewer` on the secret:
 
 ```bash
 gcloud run services add-iam-policy-binding $SERVICE --region=$REGION \
   --member="user:<partner-email>" --role="roles/run.invoker"
+gcloud secrets add-iam-policy-binding $SECRET \
+  --member="user:<partner-email>" --role="roles/secretmanager.viewer"
 ```
 
-Your partner runs `curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" <your-URL>/files` and gets the list. **They have no other permission in your project**: they cannot see the bucket in the console.
+Your partner can run `gcloud secrets versions list file-service-api-key --project=<your-project>` and see the versions, but `gcloud secrets versions access 2 ...` returns **PERMISSION_DENIED**. `viewer` shows the **metadata**; only `secretAccessor` reveals the **value**. Without the key, their calls get a 401 even though IAM lets them in.
 
 <details>
 <summary>Activity 1 questions</summary>
 
-1. *The call without a token returned 403 and the one with a token returned "permission denied" from the app. Which principal was missing a role in each case?*
-   Without a token: **you** (the caller), missing `run.invoker`; Cloud Run's IAM stops it. With a token: **`run-sa`** (the app), missing `storage.objectViewer` on the bucket.
-2. *Why did we grant `objectViewer` on the bucket and not on the project?*
-   So the app can read **only that bucket**, not every bucket in the project (least privilege, smaller *blast radius*).
+1. *In step 5, which principal or mechanism stopped each call (a, b, c)?*
+   a) **you**, missing `run.invoker` (Cloud Run IAM). b) the **app**, because the API key was missing (not IAM). c) **`run-sa`**, missing `storage.objectViewer` on the bucket.
+2. *Why grant `secretAccessor` on the secret and not on the project?*
+   On the project, `run-sa` could read **every** secret in it (database passwords, other teams' keys…). On the secret, it reads only the one it needs.
+3. *Why did the service keep accepting the old key after you added version 2?*
+   Environment-variable secrets are resolved when the instance starts. You need a new revision, and pinning a version (`:2`) makes the rotation explicit.
 </details>
 
 ---
 
-## Activity 2 · A Compute Engine VM reads BigQuery (15 min)
+## Activity 2 · Encrypt data with Cloud KMS (20 min)
 
 ![Activity 2](images/activity-2.svg)
 
-**Goal:** an app running on a VM can read the BigQuery table, and a user can *see* the VM without being able to touch it.
+**Goal:** encrypt a customer file with a key you manage in **Cloud KMS**, so that **the identity that encrypts cannot decrypt**, rotate the key, and then use the same key to protect the bucket (**CMEK**).
 
-**1. Identity for the VM and the VM itself**
+**Story:** an *ingest* process encrypts customer files before archiving them. Only the *auditor* may decrypt them. Two service accounts, two opposite roles: **separation of duties**.
+
+**1. Create a key ring and a key**
 
 ```bash
-gcloud iam service-accounts create vm-sa --display-name="bq-reader-vm"
-
-gcloud compute instances create $VM --zone=$ZONE --machine-type=e2-micro \
-  --service-account=$VM_SA --scopes=cloud-platform \
-  --image-family=debian-12 --image-project=debian-cloud
+gcloud kms keyrings create $KEYRING --location=$REGION
+gcloud kms keys create $KEY --keyring=$KEYRING --location=$REGION --purpose=encryption
+gcloud kms keys versions list --key=$KEY --keyring=$KEYRING --location=$REGION
 ```
+
+The key material never leaves KMS: you send it data and it returns ciphertext. Like secrets, keys have **versions**.
 
 > [!NOTE]
-> `--scopes=cloud-platform` leaves access control entirely to **IAM**. Old *access scopes* are a legacy mechanism; today you control access with roles.
+> Key rings and keys **cannot be deleted** (only their versions can be destroyed). If you repeat the lab in the same project, the create commands say "already exists": that's fine, carry on.
 
-**2. Try to read the table from the VM**
-
-```bash
-gcloud compute ssh $VM --zone=$ZONE --tunnel-through-iap \
-  --command="bq --project_id=$PROJECT_ID head -n 3 $DATASET.customers"
-```
-
-The first time, it asks you to create an SSH key (press Enter). Result: **Access Denied**. `vm-sa` has no permission on the dataset.
-
-**3. Grant `roles/bigquery.dataViewer` only on the dataset**
-
-In BigQuery you can grant roles with SQL:
+**2. Two identities, and permission for you to act as them**
 
 ```bash
-bq query --nouse_legacy_sql --location=$REGION \
-  "GRANT \`roles/bigquery.dataViewer\` ON SCHEMA \`${PROJECT_ID}.${DATASET}\` TO \"serviceAccount:${VM_SA}\""
+gcloud iam service-accounts create ingest-sa  --display-name="Encrypts customer files"
+gcloud iam service-accounts create auditor-sa --display-name="Decrypts customer files"
+
+for SA in $INGEST_SA $AUDITOR_SA; do
+  gcloud iam service-accounts add-iam-policy-binding $SA \
+    --member="user:$(gcloud config get-value account)" \
+    --role="roles/iam.serviceAccountTokenCreator"
+done
 ```
 
-You can also do it in the console: **BigQuery → lab_data → Sharing → Permissions → Add principal**.
+`serviceAccountTokenCreator` on a service account lets you **impersonate** it: run commands *as* that account, with **its** permissions, not yours. That way the test is honest: as Owner you could do everything, and that is exactly what we want to avoid. It can take a minute to propagate.
 
-Repeat the command from step 2:
-
-```text
-+-------------+---------------+---------------------------+ ...
-| customer_id |   full_name   |           email           |
-+-------------+---------------+---------------------------+
-|        1001 | Laura Gómez   | laura.gomez@example.com   |
-```
-
-✅ **Check:** the VM reads the table.
-
-**4. Read vs query: an extra trap**
-
-Now try running SQL from the VM:
+**3. Encrypt as `ingest-sa` → `roles/cloudkms.cryptoKeyEncrypter`**
 
 ```bash
-gcloud compute ssh $VM --zone=$ZONE --tunnel-through-iap \
-  --command="bq --project_id=$PROJECT_ID query --nouse_legacy_sql 'SELECT city, COUNT(*) n FROM $DATASET.customers GROUP BY city'"
+gcloud kms encrypt --key=$KEY --keyring=$KEYRING --location=$REGION \
+  --plaintext-file=sample_data/customers.csv --ciphertext-file=customers.csv.enc \
+  --impersonate-service-account=$INGEST_SA
 ```
 
-It fails with `bigquery.jobs.create permission`. `dataViewer` lets you **read the data**, but a query is a **job**, and running jobs needs another role: `roles/bigquery.jobUser` **on the project**.
+**PERMISSION_DENIED** on `cloudkms.cryptoKeyVersions.useToEncrypt`. (If instead you see an error about `getAccessToken`, step 2 has not propagated yet: wait a minute.) Grant **only encrypt**, **on the key**:
 
 ```bash
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-  --member="serviceAccount:$VM_SA" --role="roles/bigquery.jobUser"
+gcloud kms keys add-iam-policy-binding $KEY --keyring=$KEYRING --location=$REGION \
+  --member="serviceAccount:$INGEST_SA" --role="roles/cloudkms.cryptoKeyEncrypter"
 ```
 
-Wait 30 s and try again: it works now. **Least privilege means giving exactly the roles needed, sometimes more than one.**
+Wait 30 s and repeat. Now look at the result: `head -c 200 customers.csv.enc | xxd | head`. Unreadable.
 
-**5. `roles/compute.viewer`: see without touching**
+**4. Decrypt: who can and who cannot**
+
+`ingest-sa` tries to decrypt what it just encrypted:
 
 ```bash
-gcloud iam roles describe roles/compute.viewer --format="value(includedPermissions)" \
-  | tr ';' '\n' | grep -E "instances\.(get|list|start|stop|delete)$"
+gcloud kms decrypt --key=$KEY --keyring=$KEYRING --location=$REGION \
+  --ciphertext-file=customers.csv.enc --plaintext-file=out.csv \
+  --impersonate-service-account=$INGEST_SA
 ```
 
-It contains `compute.instances.get` and `list`, but **not** `start`, `stop` or `delete`.
-**Pairs, optional:** grant it to your partner (`gcloud projects add-iam-policy-binding $PROJECT_ID --member="user:<email>" --role="roles/compute.viewer"`). Your partner can list your VMs with `gcloud compute instances list --project=<your-project>`, but gets a 403 if they try `gcloud compute instances stop`.
+**PERMISSION_DENIED** on `useToDecrypt`. **That is the goal, not a bug**: the ingest process does not need to read the data back. Now the auditor:
+
+```bash
+gcloud kms keys add-iam-policy-binding $KEY --keyring=$KEYRING --location=$REGION \
+  --member="serviceAccount:$AUDITOR_SA" --role="roles/cloudkms.cryptoKeyDecrypter"
+```
+
+Wait 30 s and repeat the decrypt command with `--impersonate-service-account=$AUDITOR_SA`, then:
+
+```bash
+diff sample_data/customers.csv out.csv && echo "Identical"
+```
+
+✅ **Check:** `ingest-sa` encrypts but cannot decrypt; `auditor-sa` decrypts.
+
+**5. Rotate the key, then switch off the old version**
+
+```bash
+gcloud kms keys versions create --key=$KEY --keyring=$KEYRING --location=$REGION --primary
+gcloud kms keys versions list --key=$KEY --keyring=$KEYRING --location=$REGION
+```
+
+Version 2 is now **primary**: new encryptions use it. Repeat the auditor's decrypt of `customers.csv.enc`: **it still works**. The ciphertext records which version encrypted it, and version 1 is still enabled. Rotating does not force you to re-encrypt old data.
+
+Now **disable** version 1 and try again:
+
+```bash
+gcloud kms keys versions disable 1 --key=$KEY --keyring=$KEYRING --location=$REGION
+# repeat the auditor's decrypt → FAILED_PRECONDITION: ... is not enabled
+gcloud kms keys versions enable 1 --key=$KEY --keyring=$KEYRING --location=$REGION
+```
+
+Not even the auditor can read it while the version is disabled. If it were **destroyed**, the data would be lost forever (*crypto-shredding*). Enable it again before moving on.
+
+> [!TIP]
+> In production, set automatic rotation: `gcloud kms keys update $KEY ... --rotation-period=90d --next-rotation-time=...`.
+
+**6. Protect the bucket with your key (CMEK) → the Cloud Storage service agent**
+
+Upload a file to the bucket encrypted with your key:
+
+```bash
+gcloud storage cp sample_data/sales_by_city.csv gs://$BUCKET/reports/cmek-test.csv \
+  --encryption-key=$KEY_NAME
+```
+
+It fails: *"Permission denied on Cloud KMS key. Please ensure that your Cloud Storage service account has been authorized to use this key."* The one who encrypts is **neither you nor `run-sa`**: it is Cloud Storage itself, through its **service agent** (a Google-managed service account for your project):
+
+```bash
+GCS_SA=$(gcloud storage service-agent)
+echo $GCS_SA        # service-<number>@gs-project-accounts.iam.gserviceaccount.com
+
+gcloud kms keys add-iam-policy-binding $KEY --keyring=$KEYRING --location=$REGION \
+  --member="serviceAccount:$GCS_SA" --role="roles/cloudkms.cryptoKeyEncrypterDecrypter"
+```
+
+Wait 30 s, repeat the upload, and check:
+
+```bash
+gcloud storage objects describe gs://$BUCKET/reports/cmek-test.csv --format="value(kms_key)"
+```
+
+Make it the bucket's **default key**, so everything uploaded from now on (including Activity 3) is encrypted with it:
+
+```bash
+gcloud storage buckets update gs://$BUCKET --default-encryption-key=$KEY_NAME
+```
+
+Finally, read the CMEK file through the app from Activity 1:
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" -H "X-API-Key: $API_KEY" $URL/files/reports/cmek-test.csv
+```
+
+It works, although **`run-sa` has no KMS role**. Cloud Storage decrypts transparently with its service agent; `run-sa` only needs `storage.objectViewer`.
+
+✅ **Check:** `cmek-test.csv` shows your `kms_key`, and the bucket has a default encryption key.
 
 <details>
 <summary>Activity 2 questions</summary>
 
-1. *Why was `dataViewer` enough for `bq head` but not for `bq query`?*
-   `bq head` reads table rows directly (`tables.getData`). `bq query` creates a **job** (`bigquery.jobs.create`), which needs `roles/bigquery.jobUser` on the project.
-2. *Which principal got which role in this activity?*
-   `vm-sa` → `bigquery.dataViewer` (on the dataset) and `bigquery.jobUser` (on the project); your partner → `compute.viewer`.
+1. *Why give `ingest-sa` `cryptoKeyEncrypter` and not `cryptoKeyEncrypterDecrypter`?*
+   If the ingest process is compromised, the attacker still cannot decrypt the archive. Separation of duties: whoever writes the data does not need to read it.
+2. *Why impersonate the service accounts instead of running the commands as yourself?*
+   As Owner you have very broad permissions, so the test would prove nothing. Impersonating shows what **that identity** can do, and it is how you test least privilege.
+3. *For CMEK on the bucket, which principal needs a KMS role: you, `run-sa` or the Cloud Storage service agent?*
+   Only the **Cloud Storage service agent**. Storage encrypts and decrypts on behalf of anyone who has storage permissions on the object.
+4. *What happens to the data if you destroy every version of the key?*
+   It becomes unrecoverable, for everyone, including Google. That is crypto-shredding: a way of deleting data you cannot reach directly (backups, copies).
 </details>
 
 ---
@@ -246,7 +374,7 @@ Try to upload a file:
 
 ```bash
 export TOKEN=$(gcloud auth print-identity-token)
-curl -s -X POST $URL/upload -H "Authorization: Bearer $TOKEN" -F "file=@sample_data/customers.csv"
+curl -s -X POST $URL/upload -H "Authorization: Bearer $TOKEN" -H "X-API-Key: $API_KEY" -F "file=@sample_data/customers.csv"
 # {"action": "storage.objects.create", "error": "permission denied", ...}
 ```
 
@@ -260,13 +388,19 @@ gcloud storage buckets add-iam-policy-binding gs://$BUCKET \
 Wait 30 s and upload the two files:
 
 ```bash
-curl -s -X POST $URL/upload -H "Authorization: Bearer $TOKEN" -F "file=@sample_data/customers.csv"
-curl -s -X POST $URL/upload -H "Authorization: Bearer $TOKEN" -F "file=@sample_data/support_tickets.txt"
+curl -s -X POST $URL/upload -H "Authorization: Bearer $TOKEN" -H "X-API-Key: $API_KEY" -F "file=@sample_data/customers.csv"
+curl -s -X POST $URL/upload -H "Authorization: Bearer $TOKEN" -H "X-API-Key: $API_KEY" -F "file=@sample_data/support_tickets.txt"
 # {"stored": "gs://.../uploads/3f9a1c2b-customers.csv"}
 ```
 
 > [!NOTE]
 > `objectCreator` creates but **cannot overwrite or delete**. That is why the app adds a random prefix to each name.
+
+Thanks to the default key from Activity 2, the uploads are already encrypted with **your** KMS key, and `run-sa` still needs no KMS role:
+
+```bash
+gcloud storage objects list "gs://$BUCKET/uploads/" --format="table(name, kms_key.basename())"
+```
 
 **2. Prepare the metric before scanning**
 
@@ -319,6 +453,11 @@ logName:"dlp-findings" AND jsonPayload.event="dlp_finding" AND severity>=WARNING
 resource.type="cloud_run_revision" AND jsonPayload.event="permission_denied"
 ```
 → The errors from Activities 1 and 3: **the app logged every time IAM said no**, and which permission was missing.
+
+```text
+resource.type="cloud_run_revision" AND jsonPayload.event="invalid_api_key"
+```
+→ The calls with a wrong or old API key (Activity 1, after the rotation). The log says *that* the key was wrong, never *which* key was sent.
 
 The same thing from the terminal:
 
@@ -417,7 +556,7 @@ source scripts/00-env.sh
 bash scripts/cleanup.sh
 ```
 
-This deletes the service, VM, bucket, dataset, metric, solution dashboard, service accounts and images. **Delete your team dashboard by hand** in Monitoring → Dashboards, and remove any roles you granted to your partner.
+This deletes the service, bucket, secret, metric, solution dashboard, service accounts and image repository, and **destroys every KMS key version** (key rings and keys cannot be deleted in Google Cloud, but destroyed versions cost nothing). **Delete your team dashboard by hand** in Monitoring → Dashboards, and remove any roles you granted to your partner.
 
 ---
 
@@ -425,7 +564,10 @@ This deletes the service, VM, bucket, dataset, metric, solution dashboard, servi
 
 [IAM roles for Cloud Run](https://cloud.google.com/run/docs/reference/iam/roles) ·
 [Cloud Storage IAM roles](https://cloud.google.com/storage/docs/access-control/iam-roles) ·
-[BigQuery GRANT statement](https://cloud.google.com/bigquery/docs/reference/standard-sql/data-control-language) ·
+[Secret Manager with Cloud Run](https://cloud.google.com/run/docs/configuring/services/secrets) ·
+[Cloud KMS roles](https://cloud.google.com/kms/docs/reference/permissions-and-roles) ·
+[CMEK for Cloud Storage](https://cloud.google.com/storage/docs/encryption/customer-managed-keys) ·
+[Service account impersonation](https://cloud.google.com/iam/docs/service-account-impersonation) ·
 [Sensitive Data Protection InfoTypes](https://cloud.google.com/sensitive-data-protection/docs/infotypes-reference) ·
 [Log-based metrics with labels](https://cloud.google.com/logging/docs/logs-based-metrics/labels) ·
 [Cloud Monitoring dashboards](https://cloud.google.com/monitoring/dashboards)

@@ -1,15 +1,19 @@
 """
 file-service — the Cloud Run app used in the GCP Security activities.
 
-GET  /                 health check
+GET  /                 health check                            (no API key)
 GET  /files            list the objects in the bucket        (needs storage.objects.list)
 GET  /files/<name>     show the first lines of one object     (needs storage.objects.get)
 POST /upload           store a file under uploads/           (needs storage.objects.create)
+
+Every endpoint except / needs the header X-API-Key. The expected key is NOT in the code:
+Cloud Run reads it from Secret Manager and passes it to the container as the env var API_KEY.
 
 The code has no credentials and no permission logic: whatever the service account
 is allowed to do in IAM is what the app can do. Every request writes one JSON log line,
 which Cloud Run turns into a structured entry in Cloud Logging.
 """
+import hmac
 import json
 import os
 import uuid
@@ -21,6 +25,7 @@ from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 BUCKET_NAME = os.environ["BUCKET_NAME"]
+API_KEY = os.environ.get("API_KEY", "")
 client = storage.Client()
 
 
@@ -37,6 +42,21 @@ def denied(action, exc):
         "hint": "the Cloud Run service account is missing an IAM role on the bucket",
         "detail": str(exc)[:300],
     }, 403
+
+
+@app.before_request
+def check_api_key():
+    """Second layer after IAM: the caller must also know the key stored in Secret Manager."""
+    if request.path == "/":
+        return None
+    if not API_KEY:
+        log("ERROR", "api_key_not_configured")
+        return {"error": "API_KEY is not configured: deploy the service with --set-secrets"}, 500
+    if not hmac.compare_digest(request.headers.get("X-API-Key", ""), API_KEY):
+        # Log THAT the key was wrong, never the key that was sent.
+        log("WARNING", "invalid_api_key", path=request.path)
+        return {"error": "missing or invalid X-API-Key header"}, 401
+    return None
 
 
 @app.get("/")

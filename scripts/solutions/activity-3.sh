@@ -14,7 +14,7 @@ sleep 30
 gcloud logging metrics create dlp_findings --config-from-file="$ROOT/monitoring/dlp_findings_metric.yaml" || true
 
 for f in customers.csv support_tickets.txt; do
-  curl -s -X POST "$URL/upload" -H "Authorization: Bearer $TOKEN" -F "file=@$ROOT/sample_data/$f"; echo
+  curl -s -X POST "$URL/upload" -H "Authorization: Bearer $TOKEN" -H "X-API-Key: $API_KEY" -F "file=@$ROOT/sample_data/$f"; echo
 done
 
 pip install --quiet -r "$ROOT/dlp/requirements.txt"
